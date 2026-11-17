@@ -31,7 +31,7 @@ test('session hooks own one receiver per task, restore it after resume and clean
       buffer = buffer.subarray(length + 4);
       if (request.method === 'thread-stream-following-changed' && !request.params.following) continue;
       const body = Buffer.from(JSON.stringify(request.method === 'thread-stream-following-changed'
-        ? { type: 'broadcast', sourceClientId: 'owner', method: 'thread-stream-state-changed', version: 11,
+        ? { type: 'broadcast', sourceClientId: 'owner', method: 'thread-stream-state-changed', version: 13,
           params: { conversationId: request.params.conversationId, change: { type: 'snapshot',
             conversationState: { cwd: root, threadRuntimeStatus: { type: 'idle' }, currentPermissions: { approvalPolicy: 'on-request' } } } } }
         : { type: 'response', requestId: request.requestId, handledByClientId: 'owner', resultType: 'success',

@@ -4,6 +4,11 @@ A Codex plugin that lets Codex tasks and Claude Code sessions message each other
 
 Claude Code lists and messages its other sessions through its own local registry. This plugin registers each Codex task in that registry, so Claude finds the task with `ListAgents` and writes to it with `SendMessage`. Claude needs no flags, plugins, or launchers. A bundled MCP server gives the Codex side `list_sessions` and `send_message`. Messages travel over Unix domain sockets in private per-user directories.
 
+This fork keeps the Desktop receiver compatible with additive stream changes. It validates the
+snapshot and patch fields it uses instead of rejecting a message solely because its stream version
+changed. Incompatible required fields still fail validation; permission and session checks remain.
+Claude Code uses its native cross-session messaging; no separate Claude plugin is required.
+
 ## Requirements
 
 - Stock Codex with its shared local app-server daemon. CLI tasks on the daemon and desktop tasks it owns work. Older desktop tasks use the desktop IPC fallback. CLI sessions started with `--no-daemon` have no inbox. Real-runtime checks cover Codex 0.159.0, 0.159.2, and 0.159.3.
@@ -14,8 +19,8 @@ Claude Code lists and messages its other sessions through its own local registry
 ## Install
 
 ```bash
-codex plugin marketplace add LeonKohli/claude-uds-bridge
-codex plugin add claude-uds-bridge@leonkohli
+codex plugin marketplace add mpisat/claude-uds-bridge
+codex plugin add claude-uds-bridge@mpisat
 ```
 
 To install from a local checkout, pass its path to `marketplace add` instead.

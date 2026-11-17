@@ -1,13 +1,13 @@
 {
   "name": "claude-uds-bridge",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Discover and message live Claude Code and Codex sessions through local UDS inboxes.",
   "author": {
     "name": "Leon Kohli"
   },
   "license": "MIT",
-  "homepage": "https://github.com/LeonKohli/claude-uds-bridge",
-  "repository": "https://github.com/LeonKohli/claude-uds-bridge",
+  "homepage": "https://github.com/mpisat/claude-uds-bridge",
+  "repository": "https://github.com/mpisat/claude-uds-bridge",
   "keywords": ["claude-code", "codex", "messaging", "multi-agent", "mcp"],
   "interface": {
     "displayName": "Claude UDS Bridge",

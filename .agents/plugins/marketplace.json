@@ -1,7 +1,7 @@
 {
-  "name": "leonkohli",
+  "name": "mpisat",
   "interface": {
-    "displayName": "Leon Kohli"
+    "displayName": "mpisat"
   },
   "plugins": [
     {

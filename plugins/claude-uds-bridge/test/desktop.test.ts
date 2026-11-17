@@ -129,3 +129,49 @@ test('a turn ending before steering starts one new turn after explicit rejection
     expect(desktop.submissions[0]?.method).toBe('thread-follower-start-turn');
   } finally { await desktop.close(); }
 });
+
+
+test('Desktop version 11 remains compatible', async () => {
+  const desktop = await receiver('idle', false, false, undefined, 11);
+  try {
+    expect(await readDesktopRuntime(desktop.path, desktop.threadId))
+      .toEqual({ status: 'idle', mode: 'prompting' });
+    expect(await deliverToDesktop(desktop.path, desktop.threadId, randomUUID(), 'legacy update'))
+      .toEqual({ status: 'started', turnId: desktop.turnId });
+    expect(desktop.submissions).toHaveLength(1);
+  } finally { await desktop.close(); }
+});
+
+test.each([11, 14])('compatible Desktop stream %i accepts additive fields', async version => {
+  const desktop = await receiver('idle', false, false, undefined, version);
+  desktop.setHistory({ futureAddedField: { ignored: true } });
+  try {
+    expect(await readDesktopRuntime(desktop.path, desktop.threadId))
+      .toEqual({ status: 'idle', mode: 'prompting' });
+    expect(await deliverToDesktop(desktop.path, desktop.threadId, randomUUID(), 'compatible update'))
+      .toEqual({ status: 'started', turnId: desktop.turnId });
+    expect(desktop.submissions).toHaveLength(1);
+  } finally { await desktop.close(); }
+});
+
+test('incompatible Desktop snapshots fail before submitting a message', async () => {
+  const desktop = await receiver('active');
+  desktop.setHistory({ cwd: 17 });
+  try {
+    await expect(readDesktopRuntime(desktop.path, desktop.threadId)).rejects.toBeInstanceOf(z.ZodError);
+    await expect(deliverToDesktop(desktop.path, desktop.threadId, randomUUID(), 'must not submit'))
+      .rejects.toBeInstanceOf(z.ZodError);
+    expect(desktop.submissions).toHaveLength(0);
+  } finally { await desktop.close(); }
+});
+
+test('unknown Desktop runtime states cannot submit messages', async () => {
+  const desktop = await receiver('active');
+  desktop.setHistory({ threadRuntimeStatus: { type: 'future-state' } });
+  try {
+    expect((await readDesktopRuntime(desktop.path, desktop.threadId)).status).toBe('unknown');
+    await expect(deliverToDesktop(desktop.path, desktop.threadId, randomUUID(), 'must not submit'))
+      .rejects.toThrow('Codex task is neither active nor idle');
+    expect(desktop.submissions).toHaveLength(0);
+  } finally { await desktop.close(); }
+});
