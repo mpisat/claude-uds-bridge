@@ -39,9 +39,15 @@ export class PeerGuard {
     )`);
   }
 
-  admit(sender: string, text: string, chain: string[], ownToken: string | null) {
+  admit(sender: string, text: string, chain: string[], ownToken: string | null | string[]) {
     if (chain.length > 28) return 'hop-runaway';
-    if (ownToken && chain.filter(token => token === ownToken).length >= 10) return 'hop-loop';
+    const own = new Set(Array.isArray(ownToken) ? ownToken : ownToken ? [ownToken] : []);
+    const counts = new Map<string, number>();
+    for (const token of chain) {
+      const count = (counts.get(token) ?? 0) + 1;
+      counts.set(token, count);
+      if (own.has(token) && count >= 10) return 'hop-loop';
+    }
     return this.db.transaction(() => {
       const now = Date.now();
       const body = createHash('sha256').update(text).digest('hex');

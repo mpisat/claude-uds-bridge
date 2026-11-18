@@ -215,13 +215,20 @@ export function hopChain(text: string) {
   return value?.split(',') ?? [];
 }
 
+export function conversationId(text: string) {
+  const value = /^<cross-session-message\s[^>]*>/.exec(text)?.[0].match(/\sconversation-id="([^"]*)"/)?.[1];
+  if (!value) return undefined;
+  try { return decodeURIComponent(value) || undefined; }
+  catch { return undefined; }
+}
+
 // fromName must be the registered name: the receiver replies to what its ListAgents listing shows.
-export function userFrame(peer: Peer, address: string, fromName: string, fromSession: string, id: string, text: string, mode: string, token: string | null, previous: string[] = []) {
+export function userFrame(peer: Peer, address: string, fromName: string, fromSession: string, id: string, text: string, mode: string, token: string | null, previous: string[] = [], conversation?: string) {
   const body = text.replaceAll('</cross-session-message', '<\\/cross-session-message');
   const chain = [...previous, ...(token ? [token] : [])].slice(-32).join(',');
   return { msgV: 1, msg_id: id, type: 'user', priority: 'next', from: address,
     session_id: peer.sessionId, message: { role: 'user', content:
-      `<cross-session-message from="${address}" from-session="${fromSession}"${chain ? ` hop-chain="${chain}"` : ''} from-name="${fromName}"${modeSchema.safeParse(mode).success ? ` from-mode="${mode}"` : ''}>\n${body}\n</cross-session-message>` } };
+      `<cross-session-message from="${address}" from-session="${fromSession}"${chain ? ` hop-chain="${chain}"` : ''}${conversation === undefined ? '' : ` conversation-id="${encodeURIComponent(conversation)}"`} from-name="${fromName}"${modeSchema.safeParse(mode).success ? ` from-mode="${mode}"` : ''}>\n${body}\n</cross-session-message>` } };
 }
 
 export function accountReceipt(peer: Peer, status: string, previous: string) {

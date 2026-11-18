@@ -93,6 +93,18 @@ The sender sees Claude's status notices, among them `held`, `delivered`, `denied
 | `status` | Show the receiver and recent transport outcomes. |
 | `inbox` | Open a dialog where you set the receive policy and hold expiry, or review the oldest held message. |
 
+## Long jobs
+
+Give `send_message` a `conversation` ID for each independent job, for example `queue-10b`.
+Reuse that ID for all of the job's messages, including delayed replies. Omitting it preserves
+the original behavior, which follows the latest consumed input.
+
+Conversations keep separate causal chains across receiver restarts. Switching jobs does not
+reset a previous job's chain or its loop guard. A conversation still stops at ten round trips
+through this receiver or more than 28 hops. Start a new ID only for independent work, never
+to retry a dropped loop. Duplicate-message, sender rate, held-message and unread-inbox limits
+remain shared across conversations. Claude uses its existing messaging tools unchanged.
+
 ## Limits
 
 - One message may reach 1,048,576 serialized characters. The sender refuses more before writing.

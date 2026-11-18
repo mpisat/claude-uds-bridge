@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { homedir } from 'node:os';
 import { extname, isAbsolute, join } from 'node:path';
 import { maxLineLength, peers, uuid } from './claude';
-import { Bridge, expirySchema, policySchema } from './bridge';
+import { Bridge, conversationSchema, expirySchema, policySchema } from './bridge';
 import { HeldDialogs } from './held-dialogs';
 import { version } from './version';
 
@@ -69,9 +69,9 @@ server.registerTool('list_sessions', { description: 'List the live local agents,
       cwd: peer.cwd, status: peer.status,
       startedAt: peer.startedAt === undefined ? null : new Date(peer.startedAt).toISOString() }))
     .sort((first, second) => (second.startedAt ?? '').localeCompare(first.startedAt ?? ''))));
-server.registerTool('send_message', { description: 'Send text to one listed agent, or set notify_when_idle alone to subscribe without sending. Its answer enters the current Codex turn, or starts one when this task is idle. Batch what you have to say into one message: a rapid burst to the same agent is refused.',
-  inputSchema: { sessionId: uuid, text: z.string().min(1).max(maxLineLength).optional(), notify_when_idle: z.boolean().default(false) }, annotations: { openWorldHint: true } },
-  async ({ sessionId, text, notify_when_idle }, extra) => result(await current(extra._meta).sendMessage(sessionId, text, notify_when_idle)));
+server.registerTool('send_message', { description: 'Send text to one listed agent, or set notify_when_idle alone to subscribe without sending. Its answer enters the current Codex turn, or starts one when this task is idle. Batch what you have to say into one message: a rapid burst to the same agent is refused. Set conversation to a stable independent job ID to keep its reply chain separate from other jobs; reuse it for that job, including late replies. Never rename a conversation to retry a loop drop.',
+  inputSchema: { sessionId: uuid, text: z.string().min(1).max(maxLineLength).optional(), notify_when_idle: z.boolean().default(false), conversation: conversationSchema.optional() }, annotations: { openWorldHint: true } },
+  async ({ sessionId, text, notify_when_idle, conversation }, extra) => result(await current(extra._meta).sendMessage(sessionId, text, notify_when_idle, conversation)));
 server.registerTool('status', { description: 'Show this task receiver, selected transport, and recent transport outcomes. A replyAddress of null means the receiver is inactive; check hook trust and the startup hook result. Read an unknown outcome here before deciding whether to resend.',
   inputSchema: {}, annotations: { readOnlyHint: true, openWorldHint: false } },
   async (_args, extra) => result(current(extra._meta).status()));

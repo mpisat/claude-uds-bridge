@@ -232,7 +232,7 @@ try {
   const state = await status();
   assert(state.messages.filter(message => message.status === 'accepted').length === 2);
   const outbound = await mcp.callTool({ name: 'send_message', arguments: { sessionId: peerId,
-    text: livePeerId ? 'Both live protocol checks passed. No reply needed.' : 'native peer reply' }, _meta: { threadId } });
+    text: livePeerId ? 'Both live protocol checks passed. No reply needed.' : 'native peer reply', conversation: 'native-check' }, _meta: { threadId } });
   assert.notEqual(outbound.isError, true, JSON.stringify(outbound));
   if (livePeerId) {
     const notice = await mcp.callTool({ name: 'send_message', arguments: { sessionId: peerId, notify_when_idle: true }, _meta: { threadId } });

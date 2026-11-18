@@ -10,7 +10,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { CancelledNotificationSchema, ElicitRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { Bridge } from '../src/bridge';
-import { findPeer, frameSchema, hopChain, maxLineLength, peers, sendFrames, sessionName, userFrame } from '../src/claude';
+import { findPeer, frameSchema, hopChain, conversationId, maxLineLength, peers, sendFrames, sessionName, userFrame } from '../src/claude';
 import { receiver } from './desktop-fixture';
 
 async function fixture(prefix = '/tmp/uds-protocol-') {
@@ -43,7 +43,7 @@ async function fixture(prefix = '/tmp/uds-protocol-') {
     pid: process.ppid, sessionId: peerId, messagingSocketPath: peerPath, cwd: root, peerProtocol: 1, peerFeatures: ['notify_idle'],
     startedAt: 1700000000000,
   }));
-  const bridge = new Bridge(desktop.threadId, configDir, stateDir, desktop.path);
+  let bridge = new Bridge(desktop.threadId, configDir, stateDir, desktop.path);
   await bridge.start(directory, root, bridge.beginSession());
   bridge.updateRuntime({ status: 'idle', mode: 'prompting' });
   const db = new Database(join(stateDir, `${desktop.threadId}.sqlite`));
@@ -60,7 +60,13 @@ async function fixture(prefix = '/tmp/uds-protocol-') {
     socket.end(JSON.stringify({ msgV: 1, from: `uds:${peerPath}`, ...frame }) + '\n');
     await once(socket, 'close');
   };
-  return { bridge, desktop, db, peerId, peerPath, frames, root, configDir, transmit, submittedInputId,
+  return { get bridge() { return bridge; }, desktop, db, peerId, peerPath, frames, root, configDir, transmit, submittedInputId,
+    async restart() {
+      await bridge.close();
+      bridge = new Bridge(desktop.threadId, configDir, stateDir, desktop.path);
+      await bridge.start(directory, root, bridge.beginSession());
+      bridge.updateRuntime({ status: 'idle', mode: 'prompting' });
+    },
     async message(mode?: string, text: string = randomUUID()) {
       const id = randomUUID();
       await transmit({ type: 'user', msg_id: id, session_id: desktop.threadId,
@@ -216,6 +222,165 @@ test('outbound hops follow the last committed peer input and reset at a real use
     f.desktop.setHistory({ turns: [], turnHistory: { kind: 'unsupported' } });
     await expect(f.bridge.sendMessage(f.peerId, 'unknown origin')).rejects.toThrow('input origin');
     expect(outgoing()).toHaveLength(4);
+  } finally { await f.close(); }
+});
+
+test('independent job conversations survive a long desktop turn and retain delayed loop guards', async () => {
+  const f = await fixture();
+  const tokens: string[] = [];
+  const lastChain = (id: string | null) => {
+    const frame = f.frames.find(frame => frame.type === 'user' && frame.msg_id === id);
+    if (!frame || frame.type !== 'user') throw new Error('Missing job frame');
+    return hopChain(frame.message.content);
+  };
+  const reply = async (chain: string[], body: string) => {
+    const id = randomUUID();
+    await f.transmit({ type: 'user', msg_id: id, message: { role: 'user', content:
+      `<cross-session-message hop-chain="${chain.join(',')}" from-mode="prompting">\n${body}\n</cross-session-message>` } });
+    return id;
+  };
+  try {
+    for (let index = 0; index < 12; index++) {
+      const sent = await f.bridge.sendMessage(f.peerId, `job ${index}`, false, `job-${index}`);
+      const chain = lastChain(sent.messageId);
+      expect(chain).toHaveLength(1);
+      expect(tokens).not.toContain(chain[0]!);
+      tokens.push(chain[0]!);
+      await reply([...chain, 'b'.repeat(24)], `job ${index} result`);
+      await until(() => f.desktop.submissions.length === index + 1);
+      const nativeId = randomUUID();
+      f.desktop.setHistory({ turns: [{ items: [{ type: 'userMessage', id: nativeId,
+        clientId: f.submittedInputId(index) }] }] });
+      // Commit consumption while sending a different conversation next iteration.
+      await f.bridge.setPolicy('default');
+    }
+    // Latest input is job 11; continuing job 0 must retain its own committed reply.
+    const resumed = await f.bridge.sendMessage(f.peerId, 'continue job zero', false, 'job-0');
+    expect(lastChain(resumed.messageId)).toEqual([tokens[0]!, 'b'.repeat(24), tokens[0]!]);
+    const loop = await reply(Array(10).fill(tokens[0]!), 'late exhausted job zero');
+    await until(() => f.bridge.status().messages.find(row => row.id === loop)?.status === 'dropped');
+    expect(f.bridge.status().messages.find(row => row.id === loop)?.drop_reason).toBe('hop-loop');
+    expect(f.desktop.submissions).toHaveLength(12);
+    const runaway = await reply(Array.from({ length: 29 }, (_, i) => i.toString(16).padStart(24, '0')), 'runaway');
+    await until(() => f.bridge.status().messages.find(row => row.id === runaway)?.status === 'dropped');
+    expect(f.bridge.status().messages.find(row => row.id === runaway)?.drop_reason).toBe('hop-runaway');
+  } finally { await f.close(); }
+});
+
+test('job conversations keep identity and history across a receiver restart', async () => {
+  const f = await fixture();
+  try {
+    const sent = await f.bridge.sendMessage(f.peerId, 'start durable job', false, 'durable');
+    const frame = f.frames.find(frame => frame.type === 'user' && frame.msg_id === sent.messageId);
+    if (!frame || frame.type !== 'user') throw new Error('Missing durable frame');
+    const token = hopChain(frame.message.content)[0]!;
+    await f.transmit({ type: 'user', msg_id: randomUUID(), message: { role: 'user', content:
+      `<cross-session-message hop-chain="${token},${'b'.repeat(24)}">\ncommitted result\n</cross-session-message>` } });
+    await until(() => f.desktop.submissions.length === 1);
+    f.desktop.setHistory({ turns: [{ items: [{ type: 'userMessage', id: randomUUID(), clientId: f.submittedInputId() }] }] });
+    await f.bridge.sendMessage(f.peerId, 'commit job reply', false, 'durable');
+    await f.restart();
+    const resumed = await f.bridge.sendMessage(f.peerId, 'resumed durable job', false, 'durable');
+    const continued = f.frames.find(frame => frame.type === 'user' && frame.msg_id === resumed.messageId);
+    expect(continued?.type === 'user' && hopChain(continued.message.content)).toEqual([token, 'b'.repeat(24), token]);
+    f.desktop.setHistory({ turns: [], turnHistory: { kind: 'unsupported' } });
+    await expect(f.bridge.sendMessage(f.peerId, 'unknown scoped origin', false, 'durable')).rejects.toThrow('input origin');
+  } finally { await f.close(); }
+});
+
+test('MCP exposes job conversations without resetting duplicate, rate or held-release guards', async () => {
+  const f = await fixture();
+  const client = new Client({ name: 'job-conversations-test', version: '1.0.0' });
+  const tokens: string[] = [];
+  const incoming = async (chain: string[], body: string) => {
+    const id = randomUUID();
+    await f.transmit({ type: 'user', msg_id: id, message: { role: 'user', content:
+      `<cross-session-message hop-chain="${chain.join(',')}">\n${body}\n</cross-session-message>` } });
+    return id;
+  };
+  try {
+    await client.connect(new StdioClientTransport({ command: process.execPath,
+      args: [process.env.UDS_MCP_TEST_ENTRYPOINT ?? join(import.meta.dir, '../src/server.ts')],
+      env: { ...process.env, CODEX_HOME: f.root, CLAUDE_CONFIG_DIR: f.configDir } }));
+    for (const conversation of ['first', 'second "é" /%']) {
+      const sent = await client.callTool({ name: 'send_message', arguments: { sessionId: f.peerId,
+        text: `start ${conversation}`, conversation }, _meta: { threadId: f.desktop.threadId } });
+      expect(sent.isError).not.toBe(true);
+      const frame = f.frames.filter(frame => frame.type === 'user').at(-1);
+      if (!frame || frame.type !== 'user') throw new Error('Missing scoped MCP frame');
+      tokens.push(hopChain(frame.message.content)[0]!);
+      expect(conversationId(frame.message.content)).toBe(conversation);
+    }
+    expect(tokens[0]).not.toBe(tokens[1]);
+    await incoming([tokens[0]!], 'same body');
+    await until(() => f.desktop.submissions.length === 1);
+    const duplicate = await incoming([tokens[1]!], 'same body');
+    await until(() => f.bridge.status().messages.find(row => row.id === duplicate)?.drop_reason === 'duplicate');
+    await f.bridge.setPolicy('hold');
+    const loop = await incoming(Array(10).fill(tokens[0]!), 'held old job loop');
+    await until(() => f.bridge.status().heldCount === 1);
+    await f.bridge.setPolicy('accept');
+    expect(f.bridge.status().messages.find(row => row.id === loop)?.drop_reason).toBe('hop-loop');
+    f.db.run('UPDATE peer_guard SET tokens=0,updated_at=?', [Date.now()]);
+    const limited = await incoming([tokens[1]!], 'different job still shares sender budget');
+    await until(() => f.bridge.status().messages.find(row => row.id === limited)?.drop_reason === 'rate-limited');
+    expect(f.desktop.submissions).toHaveLength(1);
+    const invalid = await client.callTool({ name: 'send_message', arguments: { sessionId: f.peerId,
+      text: 'invalid scope', conversation: '' }, _meta: { threadId: f.desktop.threadId } });
+    expect(invalid.isError).toBe(true);
+  } finally { await client.close(); await f.close(); }
+});
+
+test('two Codex bridges using one job ID preserve the same reply chain', async () => {
+  const a = await fixture();
+  const b = await fixture();
+  const relay = async (from: typeof a, to: typeof b, index: number, label: string) => {
+    const sent = await from.bridge.sendMessage(from.peerId, label, false, 'shared-job');
+    const frame = from.frames.find(frame => frame.type === 'user' && frame.msg_id === sent.messageId);
+    if (!frame || frame.type !== 'user') throw new Error('Missing paired bridge frame');
+    await to.transmit({ type: 'user', msg_id: sent.messageId, message: frame.message });
+    await until(() => to.desktop.submissions.length === index + 1);
+    to.desktop.setHistory({ turns: [{ items: [{ type: 'userMessage', id: randomUUID(), clientId: to.submittedInputId(index) }] }] });
+    return hopChain(frame.message.content);
+  };
+  try {
+    for (let index = 0; index < 9; index++) {
+      expect(await relay(a, b, index, `request ${index}`)).toHaveLength(index * 2 + 1);
+      expect(await relay(b, a, index, `answer ${index}`)).toHaveLength(index * 2 + 2);
+    }
+    expect(await relay(a, b, 9, 'tenth request')).toHaveLength(19);
+    const sent = await b.bridge.sendMessage(b.peerId, 'tenth answer', false, 'shared-job');
+    const frame = b.frames.find(frame => frame.type === 'user' && frame.msg_id === sent.messageId);
+    if (!frame || frame.type !== 'user') throw new Error('Missing exhausted bridge frame');
+    expect(hopChain(frame.message.content)).toHaveLength(20);
+    await a.transmit({ type: 'user', msg_id: sent.messageId, message: frame.message });
+    await until(() => a.bridge.status().messages.find(row => row.id === sent.messageId)?.drop_reason === 'hop-loop');
+    expect(a.desktop.submissions).toHaveLength(9);
+  } finally { await a.close(); await b.close(); }
+}, 15000);
+
+test('a longer delayed branch cannot reduce the conversation own-token count', async () => {
+  const f = await fixture();
+  const send = async (label: string) => {
+    const sent = await f.bridge.sendMessage(f.peerId, label, false, 'branched-job');
+    const frame = f.frames.find(frame => frame.type === 'user' && frame.msg_id === sent.messageId);
+    if (!frame || frame.type !== 'user') throw new Error('Missing branch frame');
+    return hopChain(frame.message.content);
+  };
+  const consume = async (chain: string[], index: number) => {
+    await f.transmit({ type: 'user', msg_id: randomUUID(), message: { role: 'user', content:
+      `<cross-session-message hop-chain="${chain.join(',')}">\nbranch ${index}\n</cross-session-message>` } });
+    await until(() => f.desktop.submissions.length === index + 1);
+    f.desktop.setHistory({ turns: [{ items: [{ type: 'userMessage', id: randomUUID(), clientId: f.submittedInputId(index) }] }] });
+  };
+  try {
+    const token = (await send('start branch'))[0]!;
+    await consume([...Array(9).fill(token), ...Array(9).fill('b'.repeat(24))], 0);
+    expect((await send('commit nine own hops')).filter(value => value === token)).toHaveLength(10);
+    await consume([token, ...Array(19).fill('c'.repeat(24))], 1);
+    const continued = await send('continue after longer old branch');
+    expect(continued.filter(value => value === token)).toHaveLength(10);
+    expect(continued.length).toBeGreaterThanOrEqual(21);
   } finally { await f.close(); }
 });
 

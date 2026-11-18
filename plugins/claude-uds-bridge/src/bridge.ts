@@ -2,7 +2,7 @@ import { Database } from 'bun:sqlite';
 import { mkdirSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHmac, randomBytes, randomUUID } from 'node:crypto';
-import { accountReceipt, findPeer, findPeerProcess, hopChain, inbox, peerAddress, peers, privateDirectory, processStart, register, SendRefused, sendFrames, senderMode, serializeFrame, socketPath, userFrame, uuid, type Frame, type Peer } from './claude';
+import { accountReceipt, conversationId, findPeer, findPeerProcess, hopChain, inbox, peerAddress, peers, privateDirectory, processStart, register, SendRefused, sendFrames, senderMode, serializeFrame, socketPath, userFrame, uuid, type Frame, type Peer } from './claude';
 import type { Runtime } from './desktop';
 import { deliverToCodex, readCodexInputs, readCodexRuntime, targetSchema, type Target } from './codex';
 import { z } from 'zod';
@@ -14,6 +14,7 @@ type Message = { id: string; peer_id: string; direction: string; text: string; s
   drop_reason: string | null; status_reason: string | null };
 type Subscription = { id: string; peer_id: string; peer_address: string; peer_start: string | null; direction: string };
 export const policySchema = z.enum(['default', 'accept', 'hold', 'refuse']);
+export const conversationSchema = z.string().min(1);
 export const expirySchema = z.enum(['60s', '5m', '10m', 'never']);
 type Policy = z.infer<typeof policySchema>;
 const subscriptionLifetime = 12 * 60 * 60 * 1000;
@@ -59,6 +60,10 @@ export class Bridge {
         id TEXT PRIMARY KEY, peer_id TEXT NOT NULL, peer_address TEXT NOT NULL, peer_start TEXT,
         direction TEXT NOT NULL, status TEXT NOT NULL, expires_at INTEGER NOT NULL,
         UNIQUE(direction,peer_address)
+      );
+      CREATE TABLE IF NOT EXISTS conversations (
+        peer_id TEXT NOT NULL, name TEXT NOT NULL, token TEXT NOT NULL UNIQUE,
+        chain TEXT NOT NULL DEFAULT '[]', PRIMARY KEY(peer_id,name)
       );
       CREATE TABLE IF NOT EXISTS messages (
         id TEXT PRIMARY KEY, peer_id TEXT NOT NULL, direction TEXT NOT NULL,
@@ -212,6 +217,30 @@ export class Bridge {
       for (const input of inputs.consumed) this.db.run(
         "UPDATE messages SET awaiting_input=0,native_input_id=? WHERE direction='in' AND (desktop_input_id=? OR native_input_id=?) AND status IN ('submitting','started','steered','accepted','unknown')",
         [input.id, input.clientId, input.id]);
+      for (const input of inputs.consumed) {
+        const message = this.db.query<{ text: string; peer_id: string }, [string]>(
+          "SELECT text,peer_id FROM messages WHERE direction='in' AND kind='message' AND native_input_id=? AND awaiting_input=0").get(input.id);
+        if (!message) continue;
+        const chain = hopChain(message.text);
+        const name = conversationId(message.text);
+        if (name !== undefined) this.db.run('INSERT OR IGNORE INTO conversations (peer_id,name,token) VALUES (?,?,?)',
+          [message.peer_id, name, randomBytes(12).toString('hex')]);
+        const scopes = this.db.query<{ token: string; chain: string }, [string, string | null]>(
+          'SELECT token,chain FROM conversations WHERE peer_id=? AND name=?').all(message.peer_id, name ?? null);
+        for (const token of new Set(chain)) {
+          const scope = this.db.query<{ chain: string }, [string]>('SELECT chain FROM conversations WHERE token=?').get(token);
+          if (scope && !scopes.some(scope => scope.token === token)) scopes.push({ token, chain: scope.chain });
+        }
+        for (const scope of scopes) {
+          const previous = JSON.parse(scope.chain) as string[];
+          const longest = chain.length > previous.length ? chain : previous;
+          const count = (values: string[]) => values.filter(token => token === scope.token).length;
+          // Preserve both depth and this job's own-hop high-water mark across delayed branches.
+          const missing = Math.max(count(previous), count(chain)) - count(longest);
+          const merged = JSON.stringify([...longest, ...Array(missing).fill(scope.token)]);
+          if (merged !== scope.chain) this.db.run('UPDATE conversations SET chain=? WHERE token=?', [merged, scope.token]);
+        }
+      }
     })();
     return inputs;
   }
@@ -220,13 +249,21 @@ export class Bridge {
     return this.db.query<{ total: number }, []>("SELECT count(*) AS total FROM messages WHERE direction='in' AND kind='message' AND awaiting_input=1").get()?.total ?? 0;
   }
 
-  private async outgoingHops() {
+  private async outgoingHops(sessionId: string, conversation?: string) {
     const { latest } = await this.syncInputs();
     if (latest === undefined) throw new SendRefused('Cannot determine the current input origin; no message was sent');
-    if (latest === null) return [];
+    if (conversation !== undefined) {
+      conversationSchema.parse(conversation);
+      this.db.run('INSERT OR IGNORE INTO conversations (peer_id,name,token) VALUES (?,?,?)',
+        [sessionId, conversation, randomBytes(12).toString('hex')]);
+      const scope = this.db.query<{ token: string; chain: string }, [string, string]>(
+        'SELECT token,chain FROM conversations WHERE peer_id=? AND name=?').get(sessionId, conversation)!;
+      return { token: scope.token, chain: JSON.parse(scope.chain) as string[] };
+    }
+    if (latest === null) return { token: this.ownHop(), chain: [] };
     const message = this.db.query<{ text: string }, [string]>(
       "SELECT text FROM messages WHERE direction='in' AND kind='message' AND native_input_id=?").get(latest.id);
-    return message ? hopChain(message.text) : [];
+    return { token: this.ownHop(), chain: message ? hopChain(message.text) : [] };
   }
 
   private receiver() {
@@ -238,7 +275,7 @@ export class Bridge {
     return receiver;
   }
 
-  sendMessage(sessionId: string, text?: string, notifyWhenIdle = false) {
+  sendMessage(sessionId: string, text?: string, notifyWhenIdle = false, conversation?: string) {
     return this.exclusive(async () => {
       await this.expireSubscriptions();
       if (sessionId === this.threadId) throw new Error('Cannot send to this task itself');
@@ -252,7 +289,8 @@ export class Bridge {
       const id = text ? randomUUID() : null;
       const subscriptionId = notifyWhenIdle ? randomUUID() : null;
       const frames: unknown[] = [];
-      const messageFrame = id && text ? userFrame(peer, address, receiver.name, this.threadId, id, text, this.runtime().mode, this.ownHop(), await this.outgoingHops()) : null;
+      const hops = id && text ? await this.outgoingHops(sessionId, conversation) : null;
+      const messageFrame = id && text && hops ? userFrame(peer, address, receiver.name, this.threadId, id, text, this.runtime().mode, hops.token, hops.chain, conversation) : null;
       if (messageFrame) serializeFrame(messageFrame);
       if (subscriptionId) this.subscribe(subscriptionId, peer, 'out');
       if (id && text) {
@@ -576,7 +614,11 @@ export class Bridge {
     if (claim === 'full') { await this.receipt(message, 'dropped', 'queue-full'); return; }
     if (message.kind === 'message') {
       const body = /^<cross-session-message\s[^>]*>\n([\s\S]*)\n<\/cross-session-message>$/.exec(message.text)?.[1] ?? message.text;
-      const reason = this.guard.admit(`${message.peer_address}:${message.peer_start ?? ''}`, body, hopChain(message.text), this.ownHop());
+      const chain = hopChain(message.text);
+      const tokens = chain.filter(token => this.db.query('SELECT 1 FROM conversations WHERE token=?').get(token));
+      const own = this.ownHop();
+      if (own) tokens.push(own);
+      const reason = this.guard.admit(`${message.peer_address}:${message.peer_start ?? ''}`, body, chain, tokens);
       if (reason) {
         this.db.run("UPDATE messages SET status='dropped',drop_reason=?,awaiting_input=0 WHERE id=?", [reason, message.id]);
         await this.receipt(message, 'dropped', reason);
